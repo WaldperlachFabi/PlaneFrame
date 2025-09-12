@@ -12,11 +12,27 @@ const char* client_id = "x";
 const char* client_secret = "x";
 String accessToken = "";
 unsigned long tokenExpiresAt = 0;
+unsigned long lastTokenAttempt = 0;
+const unsigned long TOKEN_ATTEMPT_INTERVAL_MS = 5000;
 
 // ---------- LED ----------
-#define LED_PIN 2
+#define LED_PIN 4
 #define NUM_LEDS 60
 Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+const int NORTH_START_LED = 0;
+const int NORTH_END_LED   = 29;
+const int SOUTH_START_LED = 30;
+const int SOUTH_END_LED   = 59;
+
+const int DEFAULT_BRIGHTNESS = 128;
+
+// ---------- Timing ----------
+const unsigned long PLANE_POLL_INTERVAL = 10000;
+const unsigned long LANDING_DELAY_MS    = 20000;
+const unsigned long LANDING_HOLD_MS     = 3000;
+const unsigned long START_HOLD_MS       = 1500;
+const unsigned long ANIM_STEP_MS        = 30;
 
 // ---------- Runway Boxen ----------
 struct Box {
@@ -26,54 +42,98 @@ struct Box {
   float neLat, neLon;
 };
 
-Box southRunway = {48.350591,11.823452, 48.341976,11.825173, 48.345327,11.853362, 48.352096,11.851771};
-Box northRunway = {48.370236,11.820893, 48.362405,11.822028, 48.365147,11.852725, 48.372215,11.851543};
+Box southRunwayEast = {48.350591,11.823452, 48.341976,11.825173, 48.345327,11.853362, 48.352096,11.851771};
+Box northRunwayEast = {48.370236,11.820893, 48.362405,11.822028, 48.365147,11.852725, 48.372215,11.851543};
+
+Box southRunwayWest = {48.340595,11.700290, 48.332208,11.701961, 48.337140,11.754650, 48.343331,11.753105};
+Box northRunwayWest = {48.363273,11.714366, 48.354035,11.716009, 48.358893,11.771707, 48.365683,11.770730};
 
 // ---------- Tracking ----------
-bool southLandingTriggered = false;
-bool northLandingTriggered = false;
-bool southStartTriggered   = false;
-bool northStartTriggered   = false;
+struct PlaneState {
+  bool landingTriggered = false;
+  bool startTriggered   = false;
+  unsigned long detectedAt = 0;
+  String lastPlane = "";
+  String pendingPlane = "";
+};
 
-unsigned long southDetectedAt = 0;
-unsigned long northDetectedAt = 0;
+PlaneState southEast, southWest, northEast, northWest;
 
-String lastSouthPlane = "";
-String lastNorthPlane = "";
-String pendingSouthPlane = "";
-String pendingNorthPlane = "";
+bool animationRunning = false;
 
-// ---------- Funktionen ----------
-void connectWiFi() {
-  Serial.print("🔌 Verbinde mit WLAN: ");
+// ---------- Letzte 5 Flugzeuge ----------
+String recentPlanes[5] = {"", "", "", "", ""};
+int recentIndex = 0;
+
+bool wasRecentlyTriggered(String callsign) {
+  for (int i = 0; i < 5; i++) {
+    if (recentPlanes[i] == callsign) return true;
+  }
+  return false;
+}
+
+void addRecentPlane(String callsign) {
+  recentPlanes[recentIndex] = callsign;
+  recentIndex = (recentIndex + 1) % 5;
+}
+
+// ---------- Hilfsfunktionen ----------
+void startWiFiNonBlocking() {
+  Serial.print("🔌 Starte WLAN: ");
   Serial.println(ssid);
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
-
-  unsigned long startAttempt = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 10000) {
-    Serial.print(".");
-    delay(500);
-  }
-  if(WiFi.status() == WL_CONNECTED){
-    Serial.println();
-    Serial.println("✅ WLAN verbunden!");
-    Serial.print("📡 IP-Adresse: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println();
-    Serial.println("❌ WLAN Verbindung fehlgeschlagen, neustarten...");
-    ESP.restart();
-  }
 }
 
 bool isInside(Box box, float lat, float lon){
-  return lat >= min(box.swLat, box.nwLat) && lat <= max(box.neLat, box.seLat) &&
-         lon >= min(box.nwLon, box.neLon) && lon <= max(box.swLon, box.seLon);
+  bool inside = lat >= min(box.swLat, box.nwLat) && lat <= max(box.neLat, box.seLat) &&
+                lon >= min(box.nwLon, box.neLon) && lon <= max(box.swLon, box.seLon);
+  return inside;
 }
 
+// ---------- Animationen ----------
+void animateLandingRange(int startLed, int endLed) {
+  animationRunning = true;
+  strip.setBrightness(DEFAULT_BRIGHTNESS);
+  for (int i = endLed; i >= startLed; --i) {
+    strip.setPixelColor(i, strip.Color(255,0,0)); // Rot für Landung
+    strip.show();
+    delay(ANIM_STEP_MS);
+  }
+  delay(LANDING_HOLD_MS);
+  strip.clear(); strip.show();
+  animationRunning = false;
+}
+
+void animateStartRange(int startLed, int endLed) {
+  animationRunning = true;
+  strip.setBrightness(DEFAULT_BRIGHTNESS);
+  for (int i = endLed; i >= startLed; --i) {   // invertiert: von rechts nach links
+    strip.setPixelColor(i, strip.Color(0,0,255)); // Blau für Start
+    strip.show();
+    delay(ANIM_STEP_MS);
+  }
+  delay(START_HOLD_MS);
+  strip.clear(); strip.show();
+  animationRunning = false;
+}
+
+void animateWiFiConnected() {
+  animationRunning = true;
+  strip.setBrightness(DEFAULT_BRIGHTNESS);
+  for (int i = 0; i < NUM_LEDS; i++) {
+    strip.setPixelColor(i, strip.Color(0,255,0)); // Grün
+    strip.show();
+    delay(20);
+  }
+  delay(500);
+  strip.clear(); strip.show();
+  animationRunning = false;
+}
+
+// ---------- OpenSky ----------
 bool fetchAccessToken() {
-  if(WiFi.status() != WL_CONNECTED) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
 
   HTTPClient http;
   http.begin("https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token");
@@ -82,7 +142,7 @@ bool fetchAccessToken() {
   String postData = "grant_type=client_credentials&client_id=" + String(client_id) + "&client_secret=" + String(client_secret);
   int httpCode = http.POST(postData);
 
-  if(httpCode != 200){
+  if (httpCode != 200) {
     Serial.print("❌ Fehler HTTP Token: ");
     Serial.println(httpCode);
     http.end();
@@ -92,158 +152,176 @@ bool fetchAccessToken() {
   String payload = http.getString();
   http.end();
 
-  DynamicJsonDocument doc(2048);
-  DeserializationError err = deserializeJson(doc, payload);
-  if(err){
-    Serial.print("❌ JSON Fehler Token: ");
-    Serial.println(err.c_str());
-    return false;
-  }
+  DynamicJsonDocument doc(4096);
+  if (deserializeJson(doc, payload)) return false;
 
   accessToken = doc["access_token"].as<String>();
   int expiresIn = doc["expires_in"].as<int>();
-  tokenExpiresAt = millis() + (expiresIn - 60) * 1000;
+  tokenExpiresAt = millis() + (unsigned long)(max(30, expiresIn - 60)) * 1000UL;
   Serial.println("✅ Access Token erhalten!");
   return true;
 }
 
-void fetchPlanes() {
-  if(WiFi.status() != WL_CONNECTED) return;
-  if(accessToken == "") return;
+// ---------- Plane fetch ----------
+unsigned long lastPlaneCheck = 0;
 
-  HTTPClient http;
-  String url = "https://opensky-network.org/api/states/all?lamin=48.33&lomin=11.72&lamax=48.37&lomax=11.85";
-  http.begin(url);
-  http.addHeader("Authorization", "Bearer " + accessToken);
-
-  int code = http.GET();
-  if(code != 200){
-    Serial.print("❌ Fehler beim Abrufen: ");
-    Serial.println(code);
-    http.end();
+void handleBox(Box box, PlaneState &state, String side, bool isNorth, float lat, float lon, float track, float altitude, String callsign, bool onGround) {
+  if (callsign == "" || onGround) return;
+  if (altitude >= 0 && altitude < 30) {
+    Serial.printf("   ⛔ %s ignoriert (%.1f m Höhe < 30 m)\n", callsign.c_str(), altitude);
+    return;
+  }
+  if (wasRecentlyTriggered(callsign)) {
+    Serial.printf("   ⛔ %s übersprungen (bereits in den letzten 5)\n", callsign.c_str());
     return;
   }
 
+  // Debug-Log
+  Serial.printf("✈️ Check %sBahn %s | %s @ Lat: %.6f, Lon: %.6f, Alt: %.1f m, Track: %.1f\n",
+                isNorth ? "Nord" : "Süd", side.c_str(), callsign.c_str(), lat, lon, altitude, track);
+
+  if (!isInside(box, lat, lon)) {
+    Serial.printf("   ➡️ %s NICHT in Box %sBahn %s\n", callsign.c_str(), isNorth ? "Nord" : "Süd", side.c_str());
+    return;
+  }
+
+  Serial.printf("   ✅ %s in Box %sBahn %s erkannt!\n", callsign.c_str(), isNorth ? "Nord" : "Süd", side.c_str());
+
+  if (state.pendingPlane == "" && callsign != state.lastPlane) {
+    if (side == "WEST") {
+      if (track >= 60 && track <= 100) { // Landung von Westen Richtung Osten
+        state.pendingPlane = callsign;
+        state.detectedAt = millis();
+        state.landingTriggered = true;
+        addRecentPlane(callsign);
+        Serial.printf("   🛬 Landung getriggert auf %sBahn WEST (%s)\n", isNorth ? "Nord" : "Süd", callsign.c_str());
+      } else if (track >= 240 && track <= 280) { // Start nach Westen
+        state.pendingPlane = callsign;
+        state.startTriggered = true;
+        addRecentPlane(callsign);
+        Serial.printf("   🛫 Start getriggert auf %sBahn WEST (%s)\n", isNorth ? "Nord" : "Süd", callsign.c_str());
+      } else {
+        Serial.printf("   ⏩ Track %.1f passt NICHT für Start/Landung WEST\n", track);
+      }
+    } else { // OST
+      if (track >= 240 && track <= 280) { // Landung von Osten Richtung Westen
+        state.pendingPlane = callsign;
+        state.detectedAt = millis();
+        state.landingTriggered = true;
+        addRecentPlane(callsign);
+        Serial.printf("   🛬 Landung getriggert auf %sBahn OST (%s)\n", isNorth ? "Nord" : "Süd", callsign.c_str());
+      } else if (track >= 60 && track <= 100) { // Start nach Osten
+        state.pendingPlane = callsign;
+        state.startTriggered = true;
+        addRecentPlane(callsign);
+        Serial.printf("   🛫 Start getriggert auf %sBahn OST (%s)\n", isNorth ? "Nord" : "Süd", callsign.c_str());
+      } else {
+        Serial.printf("   ⏩ Track %.1f passt NICHT für Start/Landung OST\n", track);
+      }
+    }
+  }
+}
+
+void fetchPlanes() {
+  if (WiFi.status() != WL_CONNECTED || accessToken == "") return;
+
+  HTTPClient http;
+  String url = "https://opensky-network.org/api/states/all?lamin=48.32&lomin=11.69&lamax=48.38&lomax=11.86";
+  http.begin(url);
+  http.addHeader("Authorization", "Bearer " + accessToken);
+
+  int httpCode = http.GET();
+  if (httpCode != 200) { http.end(); return; }
   String payload = http.getString();
   http.end();
 
   DynamicJsonDocument doc(16384);
-  DeserializationError err = deserializeJson(doc, payload);
-  if(err){
-    Serial.print("❌ JSON Fehler: ");
-    Serial.println(err.c_str());
-    return;
-  }
+  if (deserializeJson(doc, payload)) return;
 
   JsonArray states = doc["states"].as<JsonArray>();
-  for(JsonArray f : states){
-    float lat = f[6].as<float>();
-    float lon = f[5].as<float>();
-    float track = f[10].as<float>(); // Richtung
-    String callsign = f[1].as<String>();
+
+  for (JsonArray f : states) {
+    float lat = f[6].isNull() ? 0.0f : f[6].as<float>();
+    float lon = f[5].isNull() ? 0.0f : f[5].as<float>();
+    float track = f[10].isNull() ? -1.0f : f[10].as<float>();
+    bool onGround = f[8].isNull() ? false : f[8].as<bool>();
+    float altitude = f[13].isNull() ? (f[7].isNull() ? -1.0f : f[7].as<float>()) : f[13].as<float>();
+    String callsign = f[1].isNull() ? "" : f[1].as<String>();
     callsign.trim();
 
-    if(callsign != "") Serial.println("📄 Flugzeug: " + callsign);
-
-    // ---------- Südbahn ----------
-    if(isInside(southRunway, lat, lon)) {
-      if(callsign != lastSouthPlane && track >= 60 && track <= 120){ // Richtung Osten -> START
-        Serial.println("🛫 Start Südbahn durch " + callsign + " Animation: jetzt");
-        southStartTriggered = true;
-        pendingSouthPlane = callsign;
-      }
-      else if(callsign != lastSouthPlane && (track < 60 || track > 120)){ // Richtung Westen -> LANDUNG
-        Serial.println("🛬 Landung Südbahn durch " + callsign + " Animation: in 20000 ms");
-        southLandingTriggered = true;
-        southDetectedAt = millis();
-        pendingSouthPlane = callsign;
-      }
-    }
-
-    // ---------- Nordbahn ----------
-    if(isInside(northRunway, lat, lon)) {
-      if(callsign != lastNorthPlane && track >= 240 && track <= 300){ // Richtung Westen -> LANDUNG
-        Serial.println("🛬 Landung Nordbahn durch " + callsign + " Animation: in 20000 ms");
-        northLandingTriggered = true;
-        northDetectedAt = millis();
-        pendingNorthPlane = callsign;
-      }
-      else if(callsign != lastNorthPlane && (track < 240 || track > 300)){ // Richtung Osten -> START
-        Serial.println("🛫 Start Nordbahn durch " + callsign + " Animation: jetzt");
-        northStartTriggered = true;
-        pendingNorthPlane = callsign;
-      }
-    }
+    // alle Boxen abarbeiten
+    handleBox(southRunwayEast, southEast, "OST", false, lat, lon, track, altitude, callsign, onGround);
+    handleBox(southRunwayWest, southWest, "WEST", false, lat, lon, track, altitude, callsign, onGround);
+    handleBox(northRunwayEast, northEast, "OST", true, lat, lon, track, altitude, callsign, onGround);
+    handleBox(northRunwayWest, northWest, "WEST", true, lat, lon, track, altitude, callsign, onGround);
   }
 }
-
-void animate(int startLed, int endLed, uint32_t color, bool forward=true){
-  if(forward){
-    for(int i=startLed; i<=endLed; i++){
-      strip.setPixelColor(i, color);
-      strip.show();
-      delay(30);
-    }
-  } else {
-    for(int i=endLed; i>=startLed; i--){
-      strip.setPixelColor(i, color);
-      strip.show();
-      delay(30);
-    }
-  }
-  // Kein sofortiges Löschen!
-}
-
 
 // ---------- Setup ----------
 void setup() {
   Serial.begin(115200);
   strip.begin();
-  strip.clear();
-  strip.show();
-
-  connectWiFi();
-  fetchAccessToken();
+  strip.clear(); strip.show();
+  startWiFiNonBlocking();
 }
 
 // ---------- Loop ----------
-unsigned long lastPlaneCheck = 0;
-
 void loop() {
-  if(millis() > tokenExpiresAt){
+  unsigned long now = millis();
+
+  bool wifiOK = (WiFi.status() == WL_CONNECTED);
+  bool tokenOK = (accessToken != "");
+
+  // Animation wenn WLAN verbunden
+  static bool wifiAnimDone = false;
+  if (wifiOK && !wifiAnimDone) {
+    animateWiFiConnected();
+    wifiAnimDone = true;
+  }
+
+  if (wifiOK && !tokenOK && now - lastTokenAttempt > TOKEN_ATTEMPT_INTERVAL_MS) {
+    lastTokenAttempt = now;
     fetchAccessToken();
   }
 
-  if(millis() - lastPlaneCheck > 10000){
-    lastPlaneCheck = millis();
+  if (wifiOK && tokenOK && now - lastPlaneCheck > PLANE_POLL_INTERVAL) {
+    lastPlaneCheck = now;
     fetchPlanes();
   }
 
-  // Landung Süd (rot, verzögert)
-  if(southLandingTriggered && millis() - southDetectedAt > 20000){
-    animate(30, 59, strip.Color(255,0,0), true);
-    lastSouthPlane = pendingSouthPlane;
-    southLandingTriggered = false;
+  if (!animationRunning) {
+    // Süd
+    if (southEast.startTriggered) {
+      animateStartRange(SOUTH_START_LED, SOUTH_END_LED);
+      southEast.lastPlane = southEast.pendingPlane; southEast.pendingPlane = ""; southEast.startTriggered = false;
+    } else if (southEast.landingTriggered && now - southEast.detectedAt >= LANDING_DELAY_MS) {
+      animateLandingRange(SOUTH_START_LED, SOUTH_END_LED);
+      southEast.lastPlane = southEast.pendingPlane; southEast.pendingPlane = ""; southEast.landingTriggered = false;
+    }
+    if (southWest.startTriggered) {
+      animateStartRange(SOUTH_START_LED, SOUTH_END_LED);
+      southWest.lastPlane = southWest.pendingPlane; southWest.pendingPlane = ""; southWest.startTriggered = false;
+    } else if (southWest.landingTriggered && now - southWest.detectedAt >= LANDING_DELAY_MS) {
+      animateLandingRange(SOUTH_START_LED, SOUTH_END_LED);
+      southWest.lastPlane = southWest.pendingPlane; southWest.pendingPlane = ""; southWest.landingTriggered = false;
+    }
+
+    // Nord
+    if (northEast.startTriggered) {
+      animateStartRange(NORTH_START_LED, NORTH_END_LED);
+      northEast.lastPlane = northEast.pendingPlane; northEast.pendingPlane = ""; northEast.startTriggered = false;
+    } else if (northEast.landingTriggered && now - northEast.detectedAt >= LANDING_DELAY_MS) {
+      animateLandingRange(NORTH_START_LED, NORTH_END_LED);
+      northEast.lastPlane = northEast.pendingPlane; northEast.pendingPlane = ""; northEast.landingTriggered = false;
+    }
+    if (northWest.startTriggered) {
+      animateStartRange(NORTH_START_LED, NORTH_END_LED);
+      northWest.lastPlane = northWest.pendingPlane; northWest.pendingPlane = ""; northWest.startTriggered = false;
+    } else if (northWest.landingTriggered && now - northWest.detectedAt >= LANDING_DELAY_MS) {
+      animateLandingRange(NORTH_START_LED, NORTH_END_LED);
+      northWest.lastPlane = northWest.pendingPlane; northWest.pendingPlane = ""; northWest.landingTriggered = false;
+    }
   }
 
-  // Start Süd (blau, sofort)
-  if(southStartTriggered){
-    animate(59, 30, strip.Color(0,0,255), false);
-    lastSouthPlane = pendingSouthPlane;
-    southStartTriggered = false;
-  }
-
-  // Landung Nord (rot, verzögert)
-  if(northLandingTriggered && millis() - northDetectedAt > 20000){
-    animate(0, 29, strip.Color(255,0,0), true);
-    lastNorthPlane = pendingNorthPlane;
-    northLandingTriggered = false;
-  }
-
-  // Start Nord (blau, sofort)
-  if(northStartTriggered){
-    animate(29, 0, strip.Color(0,0,255), false);
-    lastNorthPlane = pendingNorthPlane;
-    northStartTriggered = false;
-  }
+  delay(10);
 }
