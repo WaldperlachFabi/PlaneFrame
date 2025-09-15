@@ -2,14 +2,12 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Adafruit_NeoPixel.h>
-
-// ---------- WLAN ----------
-const char* ssid = "x";
-const char* password = "x";
+#include <WiFiManager.h>   // https://github.com/tzapu/WiFiManager (ESP32-kompatibler Fork)
+#include <Preferences.h>   // Für einmaliges "schon konfiguriert"-Flag
 
 // ---------- OpenSky ----------
-const char* client_id = "x";
-const char* client_secret = "x";
+String client_id = "";      // leer -> User muss setzen
+String client_secret = "";  // leer -> User muss setzen
 String accessToken = "";
 unsigned long tokenExpiresAt = 0;
 unsigned long lastTokenAttempt = 0;
@@ -60,6 +58,7 @@ struct PlaneState {
 PlaneState southEast, southWest, northEast, northWest;
 
 bool animationRunning = false;
+bool wifiAnimDone = false;
 
 // ---------- Letzte 5 Flugzeuge ----------
 String recentPlanes[5] = {"", "", "", "", ""};
@@ -78,16 +77,9 @@ void addRecentPlane(String callsign) {
 }
 
 // ---------- Hilfsfunktionen ----------
-void startWiFiNonBlocking() {
-  Serial.print("🔌 Starte WLAN: ");
-  Serial.println(ssid);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-}
-
 bool isInside(Box box, float lat, float lon){
   bool inside = lat >= min(box.swLat, box.nwLat) && lat <= max(box.neLat, box.seLat) &&
-                lon >= min(box.nwLon, box.neLon) && lon <= max(box.swLon, box.seLon);
+                lon >= min(box.nwLon, box.neLon) && lon <= max(box.swLon, box.neLon);
   return inside;
 }
 
@@ -96,7 +88,7 @@ void animateLandingRange(int startLed, int endLed) {
   animationRunning = true;
   strip.setBrightness(DEFAULT_BRIGHTNESS);
   for (int i = endLed; i >= startLed; --i) {
-    strip.setPixelColor(i, strip.Color(255,0,0)); // Rot für Landung
+    strip.setPixelColor(i, strip.Color(255,0,0));
     strip.show();
     delay(ANIM_STEP_MS);
   }
@@ -108,8 +100,8 @@ void animateLandingRange(int startLed, int endLed) {
 void animateStartRange(int startLed, int endLed) {
   animationRunning = true;
   strip.setBrightness(DEFAULT_BRIGHTNESS);
-  for (int i = endLed; i >= startLed; --i) {   // invertiert: von rechts nach links
-    strip.setPixelColor(i, strip.Color(0,0,255)); // Blau für Start
+  for (int i = endLed; i >= startLed; --i) {
+    strip.setPixelColor(i, strip.Color(0,0,255));
     strip.show();
     delay(ANIM_STEP_MS);
   }
@@ -122,7 +114,7 @@ void animateWiFiConnected() {
   animationRunning = true;
   strip.setBrightness(DEFAULT_BRIGHTNESS);
   for (int i = 0; i < NUM_LEDS; i++) {
-    strip.setPixelColor(i, strip.Color(0,255,0)); // Grün
+    strip.setPixelColor(i, strip.Color(0,255,0));
     strip.show();
     delay(20);
   }
@@ -139,7 +131,7 @@ bool fetchAccessToken() {
   http.begin("https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token");
   http.addHeader("Content-Type", "application/x-www-form-urlencoded");
 
-  String postData = "grant_type=client_credentials&client_id=" + String(client_id) + "&client_secret=" + String(client_secret);
+  String postData = "grant_type=client_credentials&client_id=" + client_id + "&client_secret=" + client_secret;
   int httpCode = http.POST(postData);
 
   if (httpCode != 200) {
@@ -153,7 +145,10 @@ bool fetchAccessToken() {
   http.end();
 
   DynamicJsonDocument doc(4096);
-  if (deserializeJson(doc, payload)) return false;
+  if (deserializeJson(doc, payload)) {
+    Serial.println("❌ Fehler beim Parsen des Token-JSON");
+    return false;
+  }
 
   accessToken = doc["access_token"].as<String>();
   int expiresIn = doc["expires_in"].as<int>();
@@ -262,23 +257,71 @@ void setup() {
   Serial.begin(115200);
   strip.begin();
   strip.clear(); strip.show();
-  startWiFiNonBlocking();
+
+  WiFi.mode(WIFI_STA);
+  WiFiManager wifiManager;
+  Preferences prefs;
+  prefs.begin("config", false);
+
+  bool wifiConfigured = prefs.getBool("wifiConfigured", false);
+
+  if (!wifiConfigured) {
+    Serial.println("⚠️ Erstes Setup erkannt -> WLAN-Reset erzwungen");
+    wifiManager.resetSettings();
+  }
+
+  // Client-ID & Secret als Pflichtfelder (starten leer)
+  WiFiManagerParameter custom_client_id("clientid", "OpenSky Client ID", "", 64);
+  WiFiManagerParameter custom_client_secret("clientsecret", "OpenSky Client Secret", "", 128);
+  wifiManager.addParameter(&custom_client_id);
+  wifiManager.addParameter(&custom_client_secret);
+
+  Serial.println("Starte WiFiManager...");
+  if (!wifiManager.autoConnect("RunwayFrame")) {
+    Serial.println("! WiFiManager: Verbindung fehlgeschlagen oder Timeout. Neustart...");
+    delay(3000);
+    ESP.restart();
+  }
+
+  // Credentials übernehmen
+  client_id = String(custom_client_id.getValue());
+  client_secret = String(custom_client_secret.getValue());
+
+  Serial.print("✅ Verbunden mit WLAN: "); Serial.println(WiFi.SSID());
+
+  if (!wifiConfigured) {
+    prefs.putBool("wifiConfigured", true);
+    Serial.println("💾 Erstkonfig abgeschlossen, Flag gespeichert.");
+  }
+  prefs.end();
+
+  animateWiFiConnected();
+  wifiAnimDone = true;
 }
+
 
 // ---------- Loop ----------
 void loop() {
   unsigned long now = millis();
+// --- Serial-Befehl abfangen ---
+  if (Serial.available()) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    if (input.equalsIgnoreCase("wifi")) {
+      Serial.println("🔄 Befehl 'wifi' empfangen -> WLAN-Reset & Captive Portal beim Neustart");
+      Preferences prefs;
+      prefs.begin("config", false);
+      prefs.putBool("wifiConfigured", false); // wieder "frisch"
+      prefs.end();
 
+      WiFi.disconnect(true, true);  // WLAN trennen und Credentials löschen
+      delay(1000);
+      ESP.restart();                // Neustart -> Captive Portal
+    } }
   bool wifiOK = (WiFi.status() == WL_CONNECTED);
   bool tokenOK = (accessToken != "");
 
-  // Animation wenn WLAN verbunden
-  static bool wifiAnimDone = false;
-  if (wifiOK && !wifiAnimDone) {
-    animateWiFiConnected();
-    wifiAnimDone = true;
-  }
-
+  // Token holen falls nötig
   if (wifiOK && !tokenOK && now - lastTokenAttempt > TOKEN_ATTEMPT_INTERVAL_MS) {
     lastTokenAttempt = now;
     fetchAccessToken();
@@ -286,7 +329,13 @@ void loop() {
 
   if (wifiOK && tokenOK && now - lastPlaneCheck > PLANE_POLL_INTERVAL) {
     lastPlaneCheck = now;
-    fetchPlanes();
+    // erneuern, wenn Token abläuft
+    if (millis() >= tokenExpiresAt) {
+      Serial.println("Token abgelaufen -> neu anfragen");
+      accessToken = "";
+    } else {
+      fetchPlanes();
+    }
   }
 
   if (!animationRunning) {
