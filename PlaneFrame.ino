@@ -4,6 +4,7 @@
 #include <Adafruit_NeoPixel.h>
 #include <WiFiManager.h>   // https://github.com/tzapu/WiFiManager (ESP32-kompatibler Fork)
 #include <Preferences.h>   // Für persistenten Flag & Speicherung client_id/secret
+#include <time.h>          // NTP / Zeitfunktionen
 
 // ---------- Globals ----------
 Preferences prefs;
@@ -237,6 +238,14 @@ bool fetchAccessToken() {
 
   String postData = "grant_type=client_credentials&client_id=" + client_id + "&client_secret=" + client_secret;
   int httpCode = http.POST(postData);
+  String payload = http.getString();
+
+  Serial.printf("Token-Request -> HTTP Code: %d, Payload length: %u\n", httpCode, (unsigned int)payload.length());
+  if (payload.length() > 0) {
+    int dumpLen = payload.length() > 800 ? 800 : payload.length();
+    Serial.println("Token-Payload (truncated):");
+    Serial.println(payload.substring(0, dumpLen));
+  }
 
   if (httpCode == 400) {
     Serial.println("❌ Fehler HTTP Token: 400 (ungültige Credentials)");
@@ -259,18 +268,18 @@ bool fetchAccessToken() {
   }
 
   if (httpCode != 200) {
-    Serial.print("❌ Fehler HTTP Token: ");
-    Serial.println(httpCode);
+    Serial.printf("❌ Fehler HTTP Token: %d\n", httpCode);
     http.end();
     return false;
   }
 
-  String payload = http.getString();
   http.end();
 
   DynamicJsonDocument doc(4096);
-  if (deserializeJson(doc, payload)) {
-    Serial.println("❌ Fehler beim Parsen des Token-JSON");
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.print("❌ Fehler beim Parsen des Token-JSON: ");
+    Serial.println(err.c_str());
     return false;
   }
 
@@ -350,14 +359,44 @@ void fetchPlanes() {
   http.addHeader("Authorization", "Bearer " + accessToken);
 
   int httpCode = http.GET();
-  if (httpCode != 200) { http.end(); return; }
   String payload = http.getString();
+
+  Serial.printf("Plane-Request -> HTTP Code: %d, Payload length: %u\n", httpCode, (unsigned int)payload.length());
+  if (payload.length() > 0) {
+    int dumpLen = payload.length() > 800 ? 800 : payload.length();
+    Serial.println("Plane-Payload (truncated):");
+    Serial.println(payload.substring(0, dumpLen));
+  }
+
+  if (httpCode <= 0) {
+    Serial.println("❌ HTTP GET Fehler: Verbindung fehlgeschlagen / Timeout.");
+    http.end();
+    return;
+  }
+
+  if (httpCode != 200) {
+    Serial.printf("❌ HTTP GET returned non-200: %d\n", httpCode);
+    http.end();
+    return;
+  }
+
   http.end();
 
   DynamicJsonDocument doc(16384);
-  if (deserializeJson(doc, payload)) return;
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.print("❌ Fehler beim Parsen des Plane-JSON: ");
+    Serial.println(err.c_str());
+    return;
+  }
+
+  if (!doc.containsKey("states")) {
+    Serial.println("❌ JSON enthält keinen 'states'-Eintrag.");
+    return;
+  }
 
   JsonArray states = doc["states"].as<JsonArray>();
+  Serial.printf("🔎 Anzahl states: %u\n", (unsigned int)states.size());
 
   for (JsonArray f : states) {
     float lat = f[6].isNull() ? 0.0f : f[6].as<float>();
@@ -375,6 +414,17 @@ void fetchPlanes() {
     handleBox(northRunwayWest, northWest, "WEST", true, lat, lon, track, altitude, callsign, onGround);
   }
 }
+
+// ---------- NTP / TZ Globals ----------
+bool ntpConfigured = false;
+int lastPrintedMinute = -1; // initial ungültig
+
+// ---------- FIXED TIME OFFSET (Neu) ----------
+// Wenn auf true gesetzt, werden alle Zeitausgaben **fest** um FIXED_TIME_OFFSET_SECONDS erhöht.
+// -> Das ist eine einfache Lösung um UTC+2 anzuzeigen (überschreibt DST).
+// Setze auf false falls du lieber die lokale TZ (setenv/tzset) nutzen willst.
+const bool FORCE_FIXED_TIME_OFFSET = true;         // <--- hier +2h erzwingen
+const long FIXED_TIME_OFFSET_SECONDS = 2 * 3600L;  // +2 Stunden
 
 // ---------- Setup ----------
 void setup() {
@@ -427,6 +477,17 @@ void setup() {
       wifiAnimDone = true;
     }
   }
+
+  // Hinweis: NTP wird nach erfolgreichem WiFi-Connect in loop() initialisiert,
+  // damit die gleiche Logik auch beim Reconnect greift.
+}
+
+// ... [alles wie in deinem Code oben bis vor loop()] ...
+
+// ---------- Quiet Hours (23–7 Uhr) ----------
+bool isQuietHours(struct tm &timeinfo) {
+  int h = timeinfo.tm_hour;
+  return (h >= 23 || h < 7);
 }
 
 // ---------- Loop ----------
@@ -445,34 +506,77 @@ void loop() {
       prefs.remove("client_secret");
       prefs.end();
 
-      WiFi.disconnect(true, true);  // WLAN trennen und Credentials löschen
+      WiFi.disconnect(true, true);  
       delay(1000);
-      ESP.restart();                // Neustart -> Captive Portal
+      ESP.restart();                
     }
   }
 
   bool wifiOK = (WiFi.status() == WL_CONNECTED);
   bool tokenOK = (accessToken != "");
 
-  // Token holen falls nötig (wenn WiFi OK und kein Token vorhanden)
+  // NTP / TZ initialisieren sobald WiFi verbunden ist (einmalig)
+  if (wifiOK && !ntpConfigured) {
+    if (!FORCE_FIXED_TIME_OFFSET) {
+      setenv("TZ", "CET-1CEST,M3.5.0/02:00,M10.5.0/03:00", 1);
+      tzset();
+      configTime(0, 0, "de.pool.ntp.org");
+      Serial.println("⏱️ NTP initialisiert (lokale TZ)...");
+    } else {
+      configTime(0, 0, "de.pool.ntp.org");
+      Serial.println("⏱️ NTP initialisiert (feste Anzeige +2h)...");
+    }
+    ntpConfigured = true;
+    lastPrintedMinute = -1;
+  }
+
+  // Zeit abrufen
+  time_t now_t_raw = time(nullptr);
+  time_t now_t = now_t_raw;
+  struct tm timeinfo;
+
+  if (FORCE_FIXED_TIME_OFFSET) {
+    now_t += FIXED_TIME_OFFSET_SECONDS;
+    gmtime_r(&now_t, &timeinfo);
+  } else {
+    localtime_r(&now_t, &timeinfo);
+  }
+
+  // Jede Minute Uhrzeit ausgeben
+  if (timeinfo.tm_year + 1900 >= 2020) {
+    int curMin = timeinfo.tm_min;
+    if (curMin != lastPrintedMinute) {
+      char buf[64];
+      strftime(buf, sizeof(buf), "%d.%m.%Y %H:%M:%S", &timeinfo);
+      Serial.print("Aktuelle Zeit (DE): ");
+      Serial.println(buf);
+      lastPrintedMinute = curMin;
+    }
+  }
+
+  // Token holen falls nötig
   if (wifiOK && !tokenOK && now - lastTokenAttempt > TOKEN_ATTEMPT_INTERVAL_MS) {
     lastTokenAttempt = now;
     fetchAccessToken();
   }
 
-  // Plane fetch loop
+  // Plane fetch nur außerhalb der Quiet Hours
   if (wifiOK && tokenOK && now - lastPlaneCheck > PLANE_POLL_INTERVAL) {
     lastPlaneCheck = now;
     if (millis() >= tokenExpiresAt) {
       Serial.println("Token abgelaufen -> neu anfragen");
       accessToken = "";
     } else {
-      fetchPlanes();
+      if (isQuietHours(timeinfo)) {
+        Serial.println("⏸️ Quiet hours – keine Abfragen/Animationen");
+      } else {
+        fetchPlanes();
+      }
     }
   }
 
-  // Animationen nur laufen lassen, wenn Portal nicht aktiv ist und WiFi verbunden ist
-  if (!animationRunning && !portalActive && wifiOK) {
+  // Animationen nur außerhalb Quiet Hours
+  if (!animationRunning && !portalActive && wifiOK && !isQuietHours(timeinfo)) {
     // Süd
     if (southEast.startTriggered) {
       animateStartRange(SOUTH_START_LED, SOUTH_END_LED);
@@ -505,6 +609,4 @@ void loop() {
       northWest.lastPlane = northWest.pendingPlane; northWest.pendingPlane = ""; northWest.landingTriggered = false;
     }
   }
-
-  delay(10);
 }
