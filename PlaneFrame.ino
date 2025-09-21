@@ -2,13 +2,41 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Adafruit_NeoPixel.h>
-#include <WiFiManager.h>   // https://github.com/tzapu/WiFiManager (ESP32-kompatibler Fork)
-#include <Preferences.h>   // Für persistenten Flag & Speicherung client_id/secret
-#include <time.h>          // NTP / Zeitfunktionen
+#include <WiFiManager.h>      // https://github.com/tzapu/WiFiManager (ESP32-kompatibler Fork)
+#include <Preferences.h>      // Für persistenten Flag & Speicherung client_id/secret
+#include <time.h>             // NTP / Zeitfunktionen
+#include <stdlib.h>
 
 // ---------- Globals ----------
 Preferences prefs;
 bool portalActive = false;
+
+// ---------- WiFiManager global ----------
+WiFiManager wm;
+bool wmParamsInitialized = false;
+
+// persistent buffers & parameter pointers (müssen im RAM bleiben)
+char buf_clientid[65];
+char buf_clientsecret[129];
+char buf_poll[16];
+char buf_landingDelay[16];
+char buf_landingHold[16];
+char buf_startHold[16];
+char buf_animStep[16];
+char buf_fixedOffset[32];
+char buf_ntp[128];
+char buf_brightness[8];
+
+WiFiManagerParameter* p_client_id = nullptr;
+WiFiManagerParameter* p_client_secret = nullptr;
+WiFiManagerParameter* p_poll = nullptr;
+WiFiManagerParameter* p_landingDelay = nullptr;
+WiFiManagerParameter* p_landingHold = nullptr;
+WiFiManagerParameter* p_startHold = nullptr;
+WiFiManagerParameter* p_animStep = nullptr;
+WiFiManagerParameter* p_fixedOffset = nullptr;
+WiFiManagerParameter* p_ntp = nullptr;
+WiFiManagerParameter* p_brightness = nullptr;
 
 // ---------- OpenSky ----------
 String client_id = "";      // leer -> User muss setzen
@@ -28,14 +56,19 @@ const int NORTH_END_LED   = 29;
 const int SOUTH_START_LED = 30;
 const int SOUTH_END_LED   = 59;
 
-const int DEFAULT_BRIGHTNESS = 128;
+// ---------- Configurable defaults (werden beim ersten Start verwendet, können im Portal geändert werden) ----------
+unsigned long planePollInterval   = 15000UL;
+unsigned long landingDelayMs      = 22000UL;
+unsigned long landingHoldMs       = 3000UL;
+unsigned long startHoldMs         = 1500UL;
+unsigned long animStepMs          = 30UL;
+int           defaultBrightness   = 64;
+long          fixedTimeOffsetSeconds = 2 * 3600L; // +2h
+String        ntpServer           = "de.pool.ntp.org";
 
 // ---------- Timing ----------
-const unsigned long PLANE_POLL_INTERVAL = 10000;
-const unsigned long LANDING_DELAY_MS    = 20000;
-const unsigned long LANDING_HOLD_MS     = 3000;
-const unsigned long START_HOLD_MS       = 1500;
-const unsigned long ANIM_STEP_MS        = 30;
+unsigned long lastPlaneCheck = 0;
+const unsigned long ANIM_MIN_STEP_MS = 1;
 
 // ---------- Runway Boxen ----------
 struct Box {
@@ -55,6 +88,7 @@ Box northRunwayWest = {48.363273,11.714366, 48.354035,11.716009, 48.358893,11.77
 struct PlaneState {
   bool landingTriggered = false;
   bool startTriggered   = false;
+  bool reversedDirection = false; // NEU: Flag für umgekehrte Animation
   unsigned long detectedAt = 0;
   String lastPlane = "";
   String pendingPlane = "";
@@ -89,7 +123,7 @@ bool isInside(Box box, float lat, float lon){
 }
 
 void setStripColorAll(uint8_t r, uint8_t g, uint8_t b) {
-  strip.setBrightness(DEFAULT_BRIGHTNESS);
+  strip.setBrightness(constrain(defaultBrightness, 0, 255));
   for (int i = 0; i < NUM_LEDS; i++) strip.setPixelColor(i, strip.Color(r, g, b));
   strip.show();
 }
@@ -107,13 +141,14 @@ void purpleFadeOnce(int steps=40, int stepDelay=10) {
   uint8_t pr = 128, pg = 0, pb = 128;
   for (int i = 0; i < NUM_LEDS; i++) strip.setPixelColor(i, strip.Color(pr, pg, pb));
   // fade in
-  for (int b = 0; b <= DEFAULT_BRIGHTNESS; b += max(1, DEFAULT_BRIGHTNESS/steps)) {
+  int maxB = constrain(defaultBrightness, 0, 255);
+  for (int b = 0; b <= maxB; b += max(1, maxB/steps)) {
     strip.setBrightness(b);
     strip.show();
     delay(stepDelay);
   }
   // fade out
-  for (int b = DEFAULT_BRIGHTNESS; b >= 0; b -= max(1, DEFAULT_BRIGHTNESS/steps)) {
+  for (int b = maxB; b >= 0; b -= max(1, maxB/steps)) {
     strip.setBrightness(b);
     strip.show();
     delay(stepDelay);
@@ -125,33 +160,61 @@ void purpleFadeOnce(int steps=40, int stepDelay=10) {
 // ---------- Animationen ----------
 void animateLandingRange(int startLed, int endLed) {
   animationRunning = true;
-  strip.setBrightness(DEFAULT_BRIGHTNESS);
+  strip.setBrightness(constrain(defaultBrightness, 0, 255));
   for (int i = endLed; i >= startLed; --i) {
     strip.setPixelColor(i, strip.Color(255,0,0)); // rot
     strip.show();
-    delay(ANIM_STEP_MS);
+    delay(max((unsigned long)ANIM_MIN_STEP_MS, animStepMs));
   }
-  delay(LANDING_HOLD_MS);
+  delay(landingHoldMs);
   strip.clear(); strip.show();
   animationRunning = false;
 }
 
 void animateStartRange(int startLed, int endLed) {
   animationRunning = true;
-  strip.setBrightness(DEFAULT_BRIGHTNESS);
+  strip.setBrightness(constrain(defaultBrightness, 0, 255));
   for (int i = endLed; i >= startLed; --i) {
     strip.setPixelColor(i, strip.Color(0,0,255)); // blau
     strip.show();
-    delay(ANIM_STEP_MS);
+    delay(max((unsigned long)ANIM_MIN_STEP_MS, animStepMs));
   }
-  delay(START_HOLD_MS);
+  delay(startHoldMs);
   strip.clear(); strip.show();
   animationRunning = false;
 }
 
+// NEUE ANIMATIONSFUNKTIONEN (REVERSED)
+void animateLandingRangeReversed(int startLed, int endLed) {
+  animationRunning = true;
+  strip.setBrightness(constrain(defaultBrightness, 0, 255));
+  for (int i = startLed; i <= endLed; ++i) { // Richtung geändert
+    strip.setPixelColor(i, strip.Color(255, 0, 0)); // rot
+    strip.show();
+    delay(max((unsigned long)ANIM_MIN_STEP_MS, animStepMs));
+  }
+  delay(landingHoldMs);
+  strip.clear(); strip.show();
+  animationRunning = false;
+}
+
+void animateStartRangeReversed(int startLed, int endLed) {
+  animationRunning = true;
+  strip.setBrightness(constrain(defaultBrightness, 0, 255));
+  for (int i = startLed; i <= endLed; ++i) { // Richtung geändert
+    strip.setPixelColor(i, strip.Color(0, 0, 255)); // blau
+    strip.show();
+    delay(max((unsigned long)ANIM_MIN_STEP_MS, animStepMs));
+  }
+  delay(startHoldMs);
+  strip.clear(); strip.show();
+  animationRunning = false;
+}
+
+
 void animateWiFiConnected() {
   animationRunning = true;
-  strip.setBrightness(DEFAULT_BRIGHTNESS);
+  strip.setBrightness(constrain(defaultBrightness, 0, 255));
   for (int i = 0; i < NUM_LEDS; i++) {
     strip.setPixelColor(i, strip.Color(0,255,0)); // grün
     strip.show();
@@ -162,52 +225,347 @@ void animateWiFiConnected() {
   animationRunning = false;
 }
 
-// ---------- Captive-Portal / Config ----------
+// ---------- Simple parsing helpers ----------
+unsigned long parseUL(const String &s, unsigned long def) {
+  if (s.length() == 0) return def;
+  char *endptr;
+  unsigned long v = strtoul(s.c_str(), &endptr, 10);
+  if (endptr == s.c_str()) return def;
+  return v;
+}
+long parseLongVal(const String &s, long def) {
+  if (s.length() == 0) return def;
+  char *endptr;
+  long v = strtol(s.c_str(), &endptr, 10);
+  if (endptr == s.c_str()) return def;
+  return v;
+}
+int parseIntVal(const String &s, int def) {
+  if (s.length() == 0) return def;
+  char *endptr;
+  long v = strtol(s.c_str(), &endptr, 10);
+  if (endptr == s.c_str()) return def;
+  if (v < INT_MIN) return def;
+  if (v > INT_MAX) return def;
+  return (int)v;
+}
+
+// ---------- Config load/save/print ----------
+void printConfig() {
+  Serial.println("==== CONFIG ====");
+  Serial.printf("WiFiConfigured flag (prefs): %s\n", prefs.getBool("wifiConfigured", false) ? "true" : "false");
+  Serial.printf("client_id: %s\n", client_id.c_str());
+  Serial.printf("client_secret: %s\n", client_secret.length() ? "<set>" : "<not set>");
+  Serial.printf("planePollInterval: %lu ms\n", planePollInterval);
+  Serial.printf("landingDelayMs: %lu ms\n", landingDelayMs);
+  Serial.printf("landingHoldMs: %lu ms\n", landingHoldMs);
+  Serial.printf("startHoldMs: %lu ms\n", startHoldMs);
+  Serial.printf("animStepMs: %lu ms\n", animStepMs);
+  Serial.printf("fixedTimeOffsetSeconds: %ld s\n", fixedTimeOffsetSeconds);
+  Serial.printf("ntpServer: %s\n", ntpServer.c_str());
+  Serial.printf("defaultBrightness: %d\n", defaultBrightness);
+  Serial.println("==== /CONFIG ====");
+}
+
+void loadConfigFromPrefs() {
+  prefs.begin("config", true); // read-only
+  client_id = prefs.getString("client_id", client_id);
+  client_secret = prefs.getString("client_secret", client_secret);
+
+  // read numeric/string values (stored as strings to be robust)
+  String s;
+
+  s = prefs.getString("planePollInterval", String(planePollInterval));
+  planePollInterval = parseUL(s, planePollInterval);
+
+  s = prefs.getString("landingDelayMs", String(landingDelayMs));
+  landingDelayMs = parseUL(s, landingDelayMs);
+
+  s = prefs.getString("landingHoldMs", String(landingHoldMs));
+  landingHoldMs = parseUL(s, landingHoldMs);
+
+  s = prefs.getString("startHoldMs", String(startHoldMs));
+  startHoldMs = parseUL(s, startHoldMs);
+
+  s = prefs.getString("animStepMs", String(animStepMs));
+  animStepMs = parseUL(s, animStepMs);
+  if (animStepMs < ANIM_MIN_STEP_MS) animStepMs = ANIM_MIN_STEP_MS;
+
+  s = prefs.getString("fixedTimeOffsetSeconds", String(fixedTimeOffsetSeconds));
+  fixedTimeOffsetSeconds = parseLongVal(s, fixedTimeOffsetSeconds);
+
+  s = prefs.getString("ntpServer", ntpServer);
+  if (s.length() > 0) ntpServer = s;
+
+  s = prefs.getString("defaultBrightness", String(defaultBrightness));
+  defaultBrightness = parseIntVal(s, defaultBrightness);
+  defaultBrightness = constrain(defaultBrightness, 0, 255);
+
+  prefs.end();
+
+  // print loaded values
+  printConfig();
+}
+
+void saveConfigToPrefsIfNotEmpty(const char *key, const String &val) {
+  if (val.length() == 0) return;
+  prefs.begin("config", false);
+  prefs.putString(key, val);
+  prefs.end();
+}
+
+// ---------- WiFiManager parameter handling ----------
+void saveConfigCallback() {
+  Serial.println("WiFiManager: saveConfigCallback aufgerufen -> speichere Parameter...");
+  prefs.begin("config", false);
+
+  if (p_client_id) {
+    String newClient = String(p_client_id->getValue());
+    if (newClient.length() > 0) {
+      prefs.putString("client_id", newClient);
+      client_id = newClient;
+      Serial.println("Client ID aus Portal übernommen (Callback).");
+    }
+  }
+  if (p_client_secret) {
+    String newSecret = String(p_client_secret->getValue());
+    if (newSecret.length() > 0) {
+      prefs.putString("client_secret", newSecret);
+      client_secret = newSecret;
+      Serial.println("Client Secret aus Portal übernommen (Callback).");
+    }
+  }
+  if (p_poll) {
+    String v = String(p_poll->getValue());
+    if (v.length() > 0) {
+      prefs.putString("planePollInterval", v);
+      planePollInterval = parseUL(v, planePollInterval);
+      Serial.printf("PollInterval gesetzt (Callback): %lu\n", planePollInterval);
+    }
+  }
+  if (p_landingDelay) {
+    String v = String(p_landingDelay->getValue());
+    if (v.length() > 0) {
+      prefs.putString("landingDelayMs", v);
+      landingDelayMs = parseUL(v, landingDelayMs);
+      Serial.printf("landingDelayMs gesetzt (Callback): %lu\n", landingDelayMs);
+    }
+  }
+  if (p_landingHold) {
+    String v = String(p_landingHold->getValue());
+    if (v.length() > 0) {
+      prefs.putString("landingHoldMs", v);
+      landingHoldMs = parseUL(v, landingHoldMs);
+      Serial.printf("landingHoldMs gesetzt (Callback): %lu\n", landingHoldMs);
+    }
+  }
+  if (p_startHold) {
+    String v = String(p_startHold->getValue());
+    if (v.length() > 0) {
+      prefs.putString("startHoldMs", v);
+      startHoldMs = parseUL(v, startHoldMs);
+      Serial.printf("startHoldMs gesetzt (Callback): %lu\n", startHoldMs);
+    }
+  }
+  if (p_animStep) {
+    String v = String(p_animStep->getValue());
+    if (v.length() > 0) {
+      prefs.putString("animStepMs", v);
+      animStepMs = parseUL(v, animStepMs);
+      if (animStepMs < ANIM_MIN_STEP_MS) animStepMs = ANIM_MIN_STEP_MS;
+      Serial.printf("animStepMs gesetzt (Callback): %lu\n", animStepMs);
+    }
+  }
+  if (p_fixedOffset) {
+    String v = String(p_fixedOffset->getValue());
+    if (v.length() > 0) {
+      prefs.putString("fixedTimeOffsetSeconds", v);
+      fixedTimeOffsetSeconds = parseLongVal(v, fixedTimeOffsetSeconds);
+      Serial.printf("fixedTimeOffsetSeconds gesetzt (Callback): %ld\n", fixedTimeOffsetSeconds);
+    }
+  }
+  if (p_ntp) {
+    String v = String(p_ntp->getValue());
+    if (v.length() > 0) {
+      prefs.putString("ntpServer", v);
+      ntpServer = v;
+      Serial.printf("ntpServer gesetzt (Callback): %s\n", ntpServer.c_str());
+    }
+  }
+  if (p_brightness) {
+    String v = String(p_brightness->getValue());
+    if (v.length() > 0) {
+      prefs.putString("defaultBrightness", v);
+      defaultBrightness = parseIntVal(v, defaultBrightness);
+      defaultBrightness = constrain(defaultBrightness, 0, 255);
+      Serial.printf("defaultBrightness gesetzt (Callback): %d\n", defaultBrightness);
+    }
+  }
+
+  // Wenn WLAN verbunden ist und OpenSky-Creds gesetzt -> flag setzen
+  if (WiFi.status() == WL_CONNECTED && client_id.length() > 0 && client_secret.length() > 0) {
+    prefs.putBool("wifiConfigured", true);
+    Serial.println("wifiConfigured flag gesetzt (Callback).");
+  } else {
+    prefs.putBool("wifiConfigured", false);
+  }
+
+  prefs.end();
+
+  // Optional: print config kurz
+  printConfig();
+}
+
+void ensureWiFiManagerParams() {
+  if (wmParamsInitialized) return;
+
+  // Fülle Buffers mit aktuellen Werten
+  strncpy(buf_clientid, client_id.c_str(), sizeof(buf_clientid)-1); buf_clientid[sizeof(buf_clientid)-1] = '\0';
+  strncpy(buf_clientsecret, client_secret.c_str(), sizeof(buf_clientsecret)-1); buf_clientsecret[sizeof(buf_clientsecret)-1] = '\0';
+  snprintf(buf_poll, sizeof(buf_poll), "%lu", planePollInterval);
+  snprintf(buf_landingDelay, sizeof(buf_landingDelay), "%lu", landingDelayMs);
+  snprintf(buf_landingHold, sizeof(buf_landingHold), "%lu", landingHoldMs);
+  snprintf(buf_startHold, sizeof(buf_startHold), "%lu", startHoldMs);
+  snprintf(buf_animStep, sizeof(buf_animStep), "%lu", animStepMs);
+  snprintf(buf_fixedOffset, sizeof(buf_fixedOffset), "%ld", fixedTimeOffsetSeconds);
+  strncpy(buf_ntp, ntpServer.c_str(), sizeof(buf_ntp)-1); buf_ntp[sizeof(buf_ntp)-1] = '\0';
+  snprintf(buf_brightness, sizeof(buf_brightness), "%d", defaultBrightness);
+
+  // allocate persistent parameters (mit new -> bleiben im RAM)
+  p_client_id = new WiFiManagerParameter("clientid", "OpenSky Client ID", buf_clientid, sizeof(buf_clientid));
+  p_client_secret = new WiFiManagerParameter("clientsecret", "OpenSky Client Secret", buf_clientsecret, sizeof(buf_clientsecret));
+  p_poll = new WiFiManagerParameter("poll", "Poll Interval (ms)", buf_poll, sizeof(buf_poll));
+  p_landingDelay = new WiFiManagerParameter("landingDelay", "Landing delay before animation (ms)", buf_landingDelay, sizeof(buf_landingDelay));
+  p_landingHold = new WiFiManagerParameter("landingHold", "Landing hold (ms)", buf_landingHold, sizeof(buf_landingHold));
+  p_startHold = new WiFiManagerParameter("startHold", "Start hold (ms)", buf_startHold, sizeof(buf_startHold));
+  p_animStep = new WiFiManagerParameter("animStep", "Animation step delay (ms)", buf_animStep, sizeof(buf_animStep));
+  p_fixedOffset = new WiFiManagerParameter("fixedOffset", "Fixed time offset (sec)", buf_fixedOffset, sizeof(buf_fixedOffset));
+  p_ntp = new WiFiManagerParameter("ntpServer", "NTP server", buf_ntp, sizeof(buf_ntp));
+  p_brightness = new WiFiManagerParameter("brightness", "LED Brightness (0-255)", buf_brightness, sizeof(buf_brightness));
+
+  // add to WiFiManager
+  wm.addParameter(p_client_id);
+  wm.addParameter(p_client_secret);
+  wm.addParameter(p_poll);
+  wm.addParameter(p_landingDelay);
+  wm.addParameter(p_landingHold);
+  wm.addParameter(p_startHold);
+  wm.addParameter(p_animStep);
+  wm.addParameter(p_fixedOffset);
+  wm.addParameter(p_ntp);
+  wm.addParameter(p_brightness);
+
+  // save-callback einmalig setzen
+  wm.setSaveConfigCallback(saveConfigCallback);
+
+  // kein Debug-Output
+  wm.setDebugOutput(false);
+
+  wmParamsInitialized = true;
+}
+
+// ---------- Captive-Portal / Config (angepasst, nutzt global wm) ----------
 void startConfigPortalLoop() {
   // Diese Funktion blockiert solange, bis WiFi verbunden ist UND client_id + client_secret gesetzt sind.
-  // Sie startet das Captive Portal wiederholt (neue WiFiManager-Instanz pro Durchlauf),
-  // und zeigt währenddessen blaue LEDs.
+  // Sie startet das Config-Portal wiederholt (gleiche Parameter auf globaler wm) und zeigt währenddessen blaue LEDs.
   while (true) {
-    // lokale WiFiManager-Instanz (vermeidet Duplikate an Parametern beim mehrfachen Aufruf)
-    WiFiManager wm;
-    wm.setDebugOutput(false);
-    // kein Config-Portal Timeout -> Portal bleibt offen bis User handelt
-    // Falls deine WiFiManager-Fork setTitle unterstützt, kannst du das nutzen (häufig vorhanden)
-    #if defined(WIFIMANAGER_HAVE_TITLE)
-      wm.setTitle("RunwayFrame");
-    #endif
+    ensureWiFiManagerParams();
 
-    // Parameterfelder (Default = aktuelle Werte, kann leer sein)
-    WiFiManagerParameter custom_client_id("clientid", "OpenSky Client ID", client_id.c_str(), 64);
-    WiFiManagerParameter custom_client_secret("clientsecret", "OpenSky Client Secret", client_secret.c_str(), 128);
-    wm.addParameter(&custom_client_id);
-    wm.addParameter(&custom_client_secret);
-
-    // Zeige blau während Portal aktiv ist
+    // Zeige blau während Portal aktiv ist (blockierender Modus)
     portalActive = true;
     setStripColorAll(0,0,255);
     Serial.println("=== Captive Portal (RunwayFrame) geöffnet - bitte SSID/Passwort und OpenSky-Daten eintragen ===");
 
     // Startet das Config-Portal (blockierend). SSID ist "RunwayFrame".
-    // startConfigPortal kehrt zurück sobald verbunden wurde (oder Benutzer das Portal schliesst).
     bool connected = wm.startConfigPortal("RunwayFrame");
     Serial.printf("wm: startConfigPortal returned: %d\n", connected);
 
-    // Falls der Benutzer Werte eingegeben hat: übernehmen und speichern
-    String newClient = String(custom_client_id.getValue());
-    String newSecret = String(custom_client_secret.getValue());
-
+    // Falls der Benutzer Werte eingegeben hat: übernehmen und speichern (falls nicht bereits durch callback)
     prefs.begin("config", false);
-    if (newClient.length() > 0) {
-      prefs.putString("client_id", newClient);
-      client_id = newClient;
-      Serial.println("Client ID aus Portal übernommen.");
+    if (p_client_id) {
+      String newClient = String(p_client_id->getValue());
+      if (newClient.length() > 0) {
+        prefs.putString("client_id", newClient);
+        client_id = newClient;
+        Serial.println("Client ID aus Portal übernommen.");
+      }
     }
-    if (newSecret.length() > 0) {
-      prefs.putString("client_secret", newSecret);
-      client_secret = newSecret;
-      Serial.println("Client Secret aus Portal übernommen.");
+    if (p_client_secret) {
+      String newSecret = String(p_client_secret->getValue());
+      if (newSecret.length() > 0) {
+        prefs.putString("client_secret", newSecret);
+        client_secret = newSecret;
+        Serial.println("Client Secret aus Portal übernommen.");
+      }
     }
+
+    if (p_poll) {
+      String v = String(p_poll->getValue());
+      if (v.length() > 0) {
+        prefs.putString("planePollInterval", v);
+        planePollInterval = parseUL(v, planePollInterval);
+        Serial.printf("PollInterval gesetzt: %lu\n", planePollInterval);
+      }
+    }
+    if (p_landingDelay) {
+      String v = String(p_landingDelay->getValue());
+      if (v.length() > 0) {
+        prefs.putString("landingDelayMs", v);
+        landingDelayMs = parseUL(v, landingDelayMs);
+        Serial.printf("landingDelayMs gesetzt: %lu\n", landingDelayMs);
+      }
+    }
+    if (p_landingHold) {
+      String v = String(p_landingHold->getValue());
+      if (v.length() > 0) {
+        prefs.putString("landingHoldMs", v);
+        landingHoldMs = parseUL(v, landingHoldMs);
+        Serial.printf("landingHoldMs gesetzt: %lu\n", landingHoldMs);
+      }
+    }
+    if (p_startHold) {
+      String v = String(p_startHold->getValue());
+      if (v.length() > 0) {
+        prefs.putString("startHoldMs", v);
+        startHoldMs = parseUL(v, startHoldMs);
+        Serial.printf("startHoldMs gesetzt: %lu\n", startHoldMs);
+      }
+    }
+    if (p_animStep) {
+      String v = String(p_animStep->getValue());
+      if (v.length() > 0) {
+        prefs.putString("animStepMs", v);
+        animStepMs = parseUL(v, animStepMs);
+        if (animStepMs < ANIM_MIN_STEP_MS) animStepMs = ANIM_MIN_STEP_MS;
+        Serial.printf("animStepMs gesetzt: %lu\n", animStepMs);
+      }
+    }
+    if (p_fixedOffset) {
+      String v = String(p_fixedOffset->getValue());
+      if (v.length() > 0) {
+        prefs.putString("fixedTimeOffsetSeconds", v);
+        fixedTimeOffsetSeconds = parseLongVal(v, fixedTimeOffsetSeconds);
+        Serial.printf("fixedTimeOffsetSeconds gesetzt: %ld\n", fixedTimeOffsetSeconds);
+      }
+    }
+    if (p_ntp) {
+      String v = String(p_ntp->getValue());
+      if (v.length() > 0) {
+        prefs.putString("ntpServer", v);
+        ntpServer = v;
+        Serial.printf("ntpServer gesetzt: %s\n", ntpServer.c_str());
+      }
+    }
+    if (p_brightness) {
+      String v = String(p_brightness->getValue());
+      if (v.length() > 0) {
+        prefs.putString("defaultBrightness", v);
+        defaultBrightness = parseIntVal(v, defaultBrightness);
+        defaultBrightness = constrain(defaultBrightness, 0, 255);
+        Serial.printf("defaultBrightness gesetzt: %d\n", defaultBrightness);
+      }
+    }
+
     // Wenn nach Portal-Aufruf WiFi verbunden ist UND creds vorhanden, setzen wir das Flag
     if (WiFi.status() == WL_CONNECTED && client_id.length() > 0 && client_secret.length() > 0) {
       prefs.putBool("wifiConfigured", true);
@@ -241,12 +599,7 @@ bool fetchAccessToken() {
   String payload = http.getString();
 
   Serial.printf("Token-Request -> HTTP Code: %d, Payload length: %u\n", httpCode, (unsigned int)payload.length());
-  if (payload.length() > 0) {
-    int dumpLen = payload.length() > 800 ? 800 : payload.length();
-    Serial.println("Token-Payload (truncated):");
-    Serial.println(payload.substring(0, dumpLen));
-  }
-
+  
   if (httpCode == 400) {
     Serial.println("❌ Fehler HTTP Token: 400 (ungültige Credentials)");
     http.end();
@@ -291,64 +644,71 @@ bool fetchAccessToken() {
 }
 
 // ---------- Plane fetch ----------
-unsigned long lastPlaneCheck = 0;
-
+// KOMPLETT ÜBERARBEITETE FUNKTION
 void handleBox(Box box, PlaneState &state, String side, bool isNorth, float lat, float lon, float track, float altitude, String callsign, bool onGround) {
   if (callsign == "" || onGround) return;
   if (altitude >= 0 && altitude < 30) {
-    Serial.printf("   ⛔ %s ignoriert (%.1f m Höhe < 30 m)\n", callsign.c_str(), altitude);
-    return;
+    return; // Zu niedrig, um relevant zu sein
   }
   if (wasRecentlyTriggered(callsign)) {
-    Serial.printf("   ⛔ %s übersprungen (bereits in den letzten 5)\n", callsign.c_str());
-    return;
+    return; // Kürzlich getriggert, um Dopplungen zu vermeiden
   }
-
-  // Debug-Log
-  Serial.printf("✈️ Check %sBahn %s | %s @ Lat: %.6f, Lon: %.6f, Alt: %.1f m, Track: %.1f\n",
-                isNorth ? "Nord" : "Süd", side.c_str(), callsign.c_str(), lat, lon, altitude, track);
-
+  
   if (!isInside(box, lat, lon)) {
-    Serial.printf("   ➡️ %s NICHT in Box %sBahn %s\n", callsign.c_str(), isNorth ? "Nord" : "Süd", side.c_str());
-    return;
+    return; // Flugzeug nicht in dieser Box
   }
 
-  Serial.printf("   ✅ %s in Box %sBahn %s erkannt!\n", callsign.c_str(), isNorth ? "Nord" : "Süd", side.c_str());
+  // Flugzeug ist in der Box, jetzt Richtung und Aktion prüfen
+  Serial.printf("✈️ Check %s @ %sBahn %s | Lat: %.4f, Lon: %.4f, Alt: %.1f m, Track: %.1f\n",
+                callsign.c_str(), isNorth ? "Nord" : "Süd", side.c_str(), lat, lon, altitude, track);
 
-  if (state.pendingPlane == "" && callsign != state.lastPlane) {
-    if (side == "WEST") {
-      if (track >= 60 && track <= 100) { // Landung von Westen Richtung Osten
+  if (state.pendingPlane == "") { // Nur triggern, wenn kein anderer Vorgang für diese Runway aktiv ist
+    
+    // Fall 1: Richtung Ost → West (Normal, Track ca. 260-280°)
+    if (track >= 260 && track <= 280) {
+      if (side == "OST") { // Flugzeug kommt aus dem Osten -> Landung
         state.pendingPlane = callsign;
         state.detectedAt = millis();
         state.landingTriggered = true;
+        state.startTriggered = false;
+        state.reversedDirection = false; // Normale Richtung
         addRecentPlane(callsign);
-        Serial.printf("   🛬 Landung getriggert auf %sBahn WEST (%s)\n", isNorth ? "Nord" : "Süd", callsign.c_str());
-      } else if (track >= 240 && track <= 280) { // Start nach Westen
+        Serial.printf("  ✅🛬 Landung erkannt: Ost → West (normal) auf %sBahn (%s)\n", isNorth ? "Nord" : "Süd", callsign.c_str());
+      } else if (side == "WEST") { // Flugzeug fliegt nach Westen -> Start
         state.pendingPlane = callsign;
+        state.detectedAt = millis();
         state.startTriggered = true;
+        state.landingTriggered = false;
+        state.reversedDirection = false; // Normale Richtung
         addRecentPlane(callsign);
-        Serial.printf("   🛫 Start getriggert auf %sBahn WEST (%s)\n", isNorth ? "Nord" : "Süd", callsign.c_str());
-      } else {
-        Serial.printf("   ⏩ Track %.1f passt NICHT für Start/Landung WEST\n", track);
+        Serial.printf("  ✅🛫 Start erkannt: Ost → West (normal) auf %sBahn (%s)\n", isNorth ? "Nord" : "Süd", callsign.c_str());
       }
-    } else { // OST
-      if (track >= 240 && track <= 280) { // Landung von Osten Richtung Westen
+    } 
+    // Fall 2: Richtung West → Ost (Reversed, Track ca. 80-100°)
+    else if (track >= 80 && track <= 100) {
+      if (side == "WEST") { // Flugzeug kommt aus dem Westen -> Landung
         state.pendingPlane = callsign;
         state.detectedAt = millis();
         state.landingTriggered = true;
+        state.startTriggered = false;
+        state.reversedDirection = true; // Umgekehrte Richtung
         addRecentPlane(callsign);
-        Serial.printf("   🛬 Landung getriggert auf %sBahn OST (%s)\n", isNorth ? "Nord" : "Süd", callsign.c_str());
-      } else if (track >= 60 && track <= 100) { // Start nach Osten
+        Serial.printf("  ✅🛬 Landung erkannt: West → Ost (reversed) auf %sBahn (%s)\n", isNorth ? "Nord" : "Süd", callsign.c_str());
+      } else if (side == "OST") { // Flugzeug fliegt nach Osten -> Start
         state.pendingPlane = callsign;
+        state.detectedAt = millis();
         state.startTriggered = true;
+        state.landingTriggered = false;
+        state.reversedDirection = true; // Umgekehrte Richtung
         addRecentPlane(callsign);
-        Serial.printf("   🛫 Start getriggert auf %sBahn OST (%s)\n", isNorth ? "Nord" : "Süd", callsign.c_str());
-      } else {
-        Serial.printf("   ⏩ Track %.1f passt NICHT für Start/Landung OST\n", track);
+        Serial.printf("  ✅🛫 Start erkannt: West → Ost (reversed) auf %sBahn (%s)\n", isNorth ? "Nord" : "Süd", callsign.c_str());
       }
+    } else {
+      Serial.printf("  ⏩ Track %.1f passt zu keiner definierten Richtung.\n", track);
     }
   }
 }
+
 
 void fetchPlanes() {
   if (WiFi.status() != WL_CONNECTED || accessToken == "") return;
@@ -359,28 +719,22 @@ void fetchPlanes() {
   http.addHeader("Authorization", "Bearer " + accessToken);
 
   int httpCode = http.GET();
-  String payload = http.getString();
-
-  Serial.printf("Plane-Request -> HTTP Code: %d, Payload length: %u\n", httpCode, (unsigned int)payload.length());
-  if (payload.length() > 0) {
-    int dumpLen = payload.length() > 800 ? 800 : payload.length();
-    Serial.println("Plane-Payload (truncated):");
-    Serial.println(payload.substring(0, dumpLen));
-  }
-
+  
   if (httpCode <= 0) {
     Serial.println("❌ HTTP GET Fehler: Verbindung fehlgeschlagen / Timeout.");
     http.end();
     return;
   }
 
+  String payload = http.getString();
+  http.end();
+
+  Serial.printf("Plane-Request -> HTTP Code: %d, Payload length: %u\n", httpCode, (unsigned int)payload.length());
+
   if (httpCode != 200) {
     Serial.printf("❌ HTTP GET returned non-200: %d\n", httpCode);
-    http.end();
     return;
   }
-
-  http.end();
 
   DynamicJsonDocument doc(16384);
   DeserializationError err = deserializeJson(doc, payload);
@@ -419,13 +773,6 @@ void fetchPlanes() {
 bool ntpConfigured = false;
 int lastPrintedMinute = -1; // initial ungültig
 
-// ---------- FIXED TIME OFFSET (Neu) ----------
-// Wenn auf true gesetzt, werden alle Zeitausgaben **fest** um FIXED_TIME_OFFSET_SECONDS erhöht.
-// -> Das ist eine einfache Lösung um UTC+2 anzuzeigen (überschreibt DST).
-// Setze auf false falls du lieber die lokale TZ (setenv/tzset) nutzen willst.
-const bool FORCE_FIXED_TIME_OFFSET = true;         // <--- hier +2h erzwingen
-const long FIXED_TIME_OFFSET_SECONDS = 2 * 3600L;  // +2 Stunden
-
 // ---------- Setup ----------
 void setup() {
   Serial.begin(115200);
@@ -439,17 +786,14 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.setHostname("RunwayFrame"); // Hostname
 
-  // load preferences (client creds + flag)
-  prefs.begin("config", false);
-  bool wifiConfigured = prefs.getBool("wifiConfigured", false);
-  String savedClient = prefs.getString("client_id", "");
-  String savedSecret = prefs.getString("client_secret", "");
-  prefs.end();
-
-  if (savedClient.length() > 0) client_id = savedClient;
-  if (savedSecret.length() > 0) client_secret = savedSecret;
+  // load preferences (client creds + flag + config)
+  loadConfigFromPrefs();
 
   // Wenn bereits als konfiguriert markiert -> versuche verbindung mit 30s Timeout
+  prefs.begin("config", true);
+  bool wifiConfigured = prefs.getBool("wifiConfigured", false);
+  prefs.end();
+
   if (wifiConfigured) {
     Serial.println("Versuche Verbindung mit gespeichertem WLAN (30s Timeout)...");
     WiFi.begin(); // versucht letzte gespeicherte AP-Credentials
@@ -459,30 +803,43 @@ void setup() {
       delay(200);
     }
     if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("WLAN Connect Timeout -> öffne Captive Portal");
+      Serial.println("WLAN Connect Timeout -> öffne Captive Portal (blockierend)");
+      // Für Fallback zur Erstkonfig nutzen wir die blockierende Variante
+      ensureWiFiManagerParams();
       startConfigPortalLoop();
     } else {
       Serial.print("✅ WLAN verbunden: "); Serial.println(WiFi.SSID());
       // connected -> show green animation
       animateWiFiConnected();
       wifiAnimDone = true;
+
+      // Param-Registrierung und dauerhaftes Web-Portal starten (non-blocking)
+      ensureWiFiManagerParams();
+      // Startet das nicht-blockierende Web-Portal (erreichbar über die lokale IP)
+      wm.startWebPortal();
+      Serial.print("Web-Portal gestartet — erreichbar unter IP: ");
+      Serial.println(WiFi.localIP());
+      // Hinweis: wir setzen portalActive nicht auf true, damit Animationen weiterlaufen
     }
   } else {
-    // Erstkonfig -> portal forcieren
-    Serial.println("Erstkonfiguration erkannt -> Captive Portal starten");
+    // Erstkonfig -> portal forcieren (blockierend)
+    Serial.println("Erstkonfiguration erkannt -> Captive Portal starten (blockierend)");
+    ensureWiFiManagerParams();
     startConfigPortalLoop();
     // startConfigPortalLoop setzt wifiConfigured intern sobald verbunden + creds gesetzt
     if (WiFi.status() == WL_CONNECTED) {
       animateWiFiConnected();
       wifiAnimDone = true;
+      // Web-Portal non-blocking zusätzlich starten, damit es später über IP erreichbar bleibt
+      wm.startWebPortal();
+      Serial.print("Web-Portal gestartet — erreichbar unter IP: ");
+      Serial.println(WiFi.localIP());
     }
   }
 
   // Hinweis: NTP wird nach erfolgreichem WiFi-Connect in loop() initialisiert,
   // damit die gleiche Logik auch beim Reconnect greift.
 }
-
-// ... [alles wie in deinem Code oben bis vor loop()] ...
 
 // ---------- Quiet Hours (23–7 Uhr) ----------
 bool isQuietHours(struct tm &timeinfo) {
@@ -494,119 +851,117 @@ bool isQuietHours(struct tm &timeinfo) {
 void loop() {
   unsigned long now = millis();
 
+  // WiFiManager background processing (macht startWebPortal reaktionsfähig)
+  if (wmParamsInitialized) {
+    wm.process();
+  }
+
   // Serial-Befehl abfangen: "wifi" -> erzwinge Portal beim nächsten Boot
   if (Serial.available()) {
     String input = Serial.readStringUntil('\n');
     input.trim();
     if (input.equalsIgnoreCase("wifi")) {
-      Serial.println("🔄 Befehl 'wifi' empfangen -> WLAN-Reset & Captive Portal beim Neustart");
+      Serial.println("Resetting WiFi config flag. Reboot to open portal.");
       prefs.begin("config", false);
       prefs.putBool("wifiConfigured", false);
-      prefs.remove("client_id");
-      prefs.remove("client_secret");
       prefs.end();
-
-      WiFi.disconnect(true, true);  
-      delay(1000);
-      ESP.restart();                
+      delay(100);
+      ESP.restart();
     }
   }
-
-  bool wifiOK = (WiFi.status() == WL_CONNECTED);
-  bool tokenOK = (accessToken != "");
-
-  // NTP / TZ initialisieren sobald WiFi verbunden ist (einmalig)
-  if (wifiOK && !ntpConfigured) {
-    if (!FORCE_FIXED_TIME_OFFSET) {
-      setenv("TZ", "CET-1CEST,M3.5.0/02:00,M10.5.0/03:00", 1);
-      tzset();
-      configTime(0, 0, "de.pool.ntp.org");
-      Serial.println("⏱️ NTP initialisiert (lokale TZ)...");
-    } else {
-      configTime(0, 0, "de.pool.ntp.org");
-      Serial.println("⏱️ NTP initialisiert (feste Anzeige +2h)...");
-    }
-    ntpConfigured = true;
-    lastPrintedMinute = -1;
-  }
-
-  // Zeit abrufen
-  time_t now_t_raw = time(nullptr);
-  time_t now_t = now_t_raw;
+  
+  // Zeit-Synchronisation & Quiet Hours
   struct tm timeinfo;
+  if (getLocalTime(&timeinfo, 500)) { // 500ms timeout
+    if (timeinfo.tm_min != lastPrintedMinute) {
+      Serial.printf("Zeit: %02d:%02d:%02d\n", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+      lastPrintedMinute = timeinfo.tm_min;
 
-  if (FORCE_FIXED_TIME_OFFSET) {
-    now_t += FIXED_TIME_OFFSET_SECONDS;
-    gmtime_r(&now_t, &timeinfo);
-  } else {
-    localtime_r(&now_t, &timeinfo);
-  }
-
-  // Jede Minute Uhrzeit ausgeben
-  if (timeinfo.tm_year + 1900 >= 2020) {
-    int curMin = timeinfo.tm_min;
-    if (curMin != lastPrintedMinute) {
-      char buf[64];
-      strftime(buf, sizeof(buf), "%d.%m.%Y %H:%M:%S", &timeinfo);
-      Serial.print("Aktuelle Zeit (DE): ");
-      Serial.println(buf);
-      lastPrintedMinute = curMin;
-    }
-  }
-
-  // Token holen falls nötig
-  if (wifiOK && !tokenOK && now - lastTokenAttempt > TOKEN_ATTEMPT_INTERVAL_MS) {
-    lastTokenAttempt = now;
-    fetchAccessToken();
-  }
-
-  // Plane fetch nur außerhalb der Quiet Hours
-  if (wifiOK && tokenOK && now - lastPlaneCheck > PLANE_POLL_INTERVAL) {
-    lastPlaneCheck = now;
-    if (millis() >= tokenExpiresAt) {
-      Serial.println("Token abgelaufen -> neu anfragen");
-      accessToken = "";
-    } else {
       if (isQuietHours(timeinfo)) {
-        Serial.println("⏸️ Quiet hours – keine Abfragen/Animationen");
+        strip.setBrightness(0);
+        strip.show();
       } else {
-        fetchPlanes();
+        strip.setBrightness(constrain(defaultBrightness, 0, 255));
       }
     }
   }
 
-  // Animationen nur außerhalb Quiet Hours
-  if (!animationRunning && !portalActive && wifiOK && !isQuietHours(timeinfo)) {
-    // Süd
-    if (southEast.startTriggered) {
-      animateStartRange(SOUTH_START_LED, SOUTH_END_LED);
-      southEast.lastPlane = southEast.pendingPlane; southEast.pendingPlane = ""; southEast.startTriggered = false;
-    } else if (southEast.landingTriggered && millis() - southEast.detectedAt >= LANDING_DELAY_MS) {
-      animateLandingRange(SOUTH_START_LED, SOUTH_END_LED);
+  // Animation triggers - nur ausführen, wenn keine andere Animation läuft und nicht in Quiet Hours
+  if (!animationRunning && (lastPrintedMinute == -1 || !isQuietHours(timeinfo))) {
+    // Priorität: Südbahn vor Nordbahn, Start vor Landung
+    
+    // --- Südbahn ---
+    if (southEast.startTriggered || southWest.startTriggered) {
+      PlaneState& s = southEast.startTriggered ? southEast : southWest;
+      Serial.printf("➡️ Animation: Start Südbahn - %s\n", s.pendingPlane.c_str());
+      if (s.reversedDirection) animateStartRangeReversed(SOUTH_START_LED, SOUTH_END_LED);
+      else animateStartRange(SOUTH_START_LED, SOUTH_END_LED);
+      s.lastPlane = s.pendingPlane; s.pendingPlane = ""; s.startTriggered = false;
+    } 
+    else if (southEast.landingTriggered && now - southEast.detectedAt > landingDelayMs) {
+      Serial.printf("➡️ Animation: Landung Südbahn - %s\n", southEast.pendingPlane.c_str());
+      if (southEast.reversedDirection) animateLandingRangeReversed(SOUTH_START_LED, SOUTH_END_LED);
+      else animateLandingRange(SOUTH_START_LED, SOUTH_END_LED);
       southEast.lastPlane = southEast.pendingPlane; southEast.pendingPlane = ""; southEast.landingTriggered = false;
     }
-    if (southWest.startTriggered) {
-      animateStartRange(SOUTH_START_LED, SOUTH_END_LED);
-      southWest.lastPlane = southWest.pendingPlane; southWest.pendingPlane = ""; southWest.startTriggered = false;
-    } else if (southWest.landingTriggered && millis() - southWest.detectedAt >= LANDING_DELAY_MS) {
-      animateLandingRange(SOUTH_START_LED, SOUTH_END_LED);
+    else if (southWest.landingTriggered && now - southWest.detectedAt > landingDelayMs) {
+      Serial.printf("➡️ Animation: Landung Südbahn - %s\n", southWest.pendingPlane.c_str());
+      if (southWest.reversedDirection) animateLandingRangeReversed(SOUTH_START_LED, SOUTH_END_LED);
+      else animateLandingRange(SOUTH_START_LED, SOUTH_END_LED);
       southWest.lastPlane = southWest.pendingPlane; southWest.pendingPlane = ""; southWest.landingTriggered = false;
     }
 
-    // Nord
-    if (northEast.startTriggered) {
-      animateStartRange(NORTH_START_LED, NORTH_END_LED);
-      northEast.lastPlane = northEast.pendingPlane; northEast.pendingPlane = ""; northEast.startTriggered = false;
-    } else if (northEast.landingTriggered && millis() - northEast.detectedAt >= LANDING_DELAY_MS) {
-      animateLandingRange(NORTH_START_LED, NORTH_END_LED);
+    // --- Nordbahn (nur wenn Südbahn frei ist) ---
+    else if (northEast.startTriggered || northWest.startTriggered) {
+      PlaneState& n = northEast.startTriggered ? northEast : northWest;
+      Serial.printf("➡️ Animation: Start Nordbahn - %s\n", n.pendingPlane.c_str());
+      if (n.reversedDirection) animateStartRangeReversed(NORTH_START_LED, NORTH_END_LED);
+      else animateStartRange(NORTH_START_LED, NORTH_END_LED);
+      n.lastPlane = n.pendingPlane; n.pendingPlane = ""; n.startTriggered = false;
+    }
+    else if (northEast.landingTriggered && now - northEast.detectedAt > landingDelayMs) {
+      Serial.printf("➡️ Animation: Landung Nordbahn - %s\n", northEast.pendingPlane.c_str());
+      if (northEast.reversedDirection) animateLandingRangeReversed(NORTH_START_LED, NORTH_END_LED);
+      else animateLandingRange(NORTH_START_LED, NORTH_END_LED);
       northEast.lastPlane = northEast.pendingPlane; northEast.pendingPlane = ""; northEast.landingTriggered = false;
     }
-    if (northWest.startTriggered) {
-      animateStartRange(NORTH_START_LED, NORTH_END_LED);
-      northWest.lastPlane = northWest.pendingPlane; northWest.pendingPlane = ""; northWest.startTriggered = false;
-    } else if (northWest.landingTriggered && millis() - northWest.detectedAt >= LANDING_DELAY_MS) {
-      animateLandingRange(NORTH_START_LED, NORTH_END_LED);
+    else if (northWest.landingTriggered && now - northWest.detectedAt > landingDelayMs) {
+      Serial.printf("➡️ Animation: Landung Nordbahn - %s\n", northWest.pendingPlane.c_str());
+      if (northWest.reversedDirection) animateLandingRangeReversed(NORTH_START_LED, NORTH_END_LED);
+      else animateLandingRange(NORTH_START_LED, NORTH_END_LED);
       northWest.lastPlane = northWest.pendingPlane; northWest.pendingPlane = ""; northWest.landingTriggered = false;
     }
   }
-}
+
+  // Check for expired pending states to prevent deadlocks (nach 90s)
+  unsigned long timeout = 90000UL;
+  if (southEast.pendingPlane != "" && now - southEast.detectedAt > timeout) { southEast.pendingPlane = ""; southEast.landingTriggered = false; southEast.startTriggered = false;}
+  if (southWest.pendingPlane != "" && now - southWest.detectedAt > timeout) { southWest.pendingPlane = ""; southWest.landingTriggered = false; southWest.startTriggered = false;}
+  if (northEast.pendingPlane != "" && now - northEast.detectedAt > timeout) { northEast.pendingPlane = ""; northEast.landingTriggered = false; northEast.startTriggered = false;}
+  if (northWest.pendingPlane != "" && now - northWest.detectedAt > timeout) { northWest.pendingPlane = ""; northWest.landingTriggered = false; northWest.startTriggered = false;}
+
+
+  // OpenSky Token Management
+  if (accessToken == "" || now > tokenExpiresAt) {
+    if (now - lastTokenAttempt > TOKEN_ATTEMPT_INTERVAL_MS) {
+      Serial.println("Token abgelaufen oder nicht vorhanden, fordere neuen an...");
+      lastTokenAttempt = now;
+      if (!fetchAccessToken()) {
+        Serial.println("Token-Anforderung fehlgeschlagen.");
+      }
+    }
+  }
+
+  // Fetch plane data periodically
+  if (accessToken != "" && now - lastPlaneCheck > planePollInterval) {
+    lastPlaneCheck = now;
+    fetchPlanes();
+  }
+
+  // NTP/Time logic - wird einmalig nach WiFi-Connect ausgeführt
+  if (WiFi.status() == WL_CONNECTED && !ntpConfigured) {
+    Serial.printf("Konfiguriere NTP mit Server: %s / Offset: %ld s\n", ntpServer.c_str(), fixedTimeOffsetSeconds);
+    configTime(fixedTimeOffsetSeconds, 3600, ntpServer.c_str()); // Offset, DaylightOffset, Server
+    ntpConfigured = true;
+  }
+} 
