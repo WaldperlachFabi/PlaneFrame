@@ -869,7 +869,7 @@ void loop() {
       ESP.restart();
     }
   }
-  
+ 
   // Zeit-Synchronisation & Quiet Hours
   struct tm timeinfo;
   if (getLocalTime(&timeinfo, 500)) { // 500ms timeout
@@ -964,4 +964,4 @@ void loop() {
     configTime(fixedTimeOffsetSeconds, 3600, ntpServer.c_str()); // Offset, DaylightOffset, Server
     ntpConfigured = true;
   }
-} 
+}
